@@ -29,9 +29,10 @@ def main(argv=None):
     client_id = appconfig['client_id']
     hostname = appconfig['hostname']
     client_secret = appconfig['client_secret']
-    tenant_alias = appconfig['tenant_alias']
+    tenant = appconfig['tenant']
+    scope = appconfig['scope']
 
-    signin_url = appconfig['signin_url'].format(**appconfig)
+    signin_url = f'https://signin.ultipro.com/signin/oath2/t/{tenant}/access_token'
 
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -44,7 +45,7 @@ def main(argv=None):
         'client_secret': client_secret,
         # From email subject:
         # "ATSG - Request for ats name Staging and Production Endpoints"
-        'scope': 'recruiting.domain.application-import.read',
+        'scope': scope,
     }
     response = requests.post(signin_url, data=payload, headers=headers)
     response.raise_for_status()
@@ -53,7 +54,7 @@ def main(argv=None):
 
     endpoint_url = (
         f'https://{hostname}/talent/recruiting/v2'
-        f'/signin/oauth2/t/{tenant_alias}/access_token'
+        f'/signin/oauth2/t/{tenant}/access_token'
     )
 
     print('payload:')
