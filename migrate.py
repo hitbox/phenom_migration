@@ -31,10 +31,7 @@ def main(argv=None):
     client_secret = appconfig['client_secret']
     tenant_alias = appconfig['tenant_alias']
 
-    endpoint_url = (
-        f'https://{hostname}/talent/recruiting/v2'
-        f'/signin/oauth2/t/{tenant_alias}/access_token'
-    )
+    signin_url = appconfig['signin_url'].format(**appconfig)
 
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -49,11 +46,18 @@ def main(argv=None):
         # "ATSG - Request for ats name Staging and Production Endpoints"
         'scope': 'recruiting.domain.application-import.read',
     }
-    response = requests.post(endpoint_url, data=payload, headers=headers)
+    response = requests.post(signin_url, data=payload, headers=headers)
+    response.raise_for_status()
+
+    print(f'{signin_url} {response.json()=}')
+
+    endpoint_url = (
+        f'https://{hostname}/talent/recruiting/v2'
+        f'/signin/oauth2/t/{tenant_alias}/access_token'
+    )
 
     print('payload:')
     pprint(payload)
-    print(f'{endpoint_url} {response}')
 
 if __name__ == "__main__":
     main()
