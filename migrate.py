@@ -3,294 +3,32 @@ import csv
 import json
 import logging
 import os
-import requests.exceptions
+import re
+import requests
 
 from configparser import RawConfigParser
 from pprint import pprint
-
-from marshmallow import Schema
-from marshmallow import fields
-from marshmallow.fields import Boolean
-from marshmallow.fields import Date
-from marshmallow.fields import DateTime
-from marshmallow.fields import Integer
-from marshmallow.fields import List
-from marshmallow.fields import Nested
-from marshmallow.fields import Dict
-from marshmallow.fields import String
+from requests.exceptions import HTTPError
 
 logger = logging.getLogger('migrate')
 
-class LinkSchema(Schema):
-
-    href = String()
-    rel = String()
-
-
-class CreatorSchema(Schema):
-
-    id = String()
-
-
-class RecruitingProcessSchema(Schema):
-
-    id = String()
-    step_id = String()
-
-
-class NameSchema(Schema):
-
-    first = String()
-    last = String()
-    former = String(allow_none=True)
-    middle = String(allow_none=True)
-    prefix = Dict(allow_none=True)
-    suffix = Dict(allow_none=True)
-
-class CandidateSchema(Schema):
-
-    id = String()
-    is_internal = Boolean()
-    is_active = Boolean()
-    employment_status = String(allow_none=True)
-    name = Nested(NameSchema)
-
-
-class FromSchema(Schema):
-
-    month = Integer(allow_none=True)
-    year = Integer(allow_none=True)
-
-class WorkExperienceSchema(Schema):
-
-    id = String()
-    links = List(Nested(LinkSchema))
-    job_title = String()
-    company = String()
-    location = String(allow_none=True)
-    from_ = Nested(FromSchema, data_key='from', allow_none=True)
-    to = Nested(FromSchema, allow_none=True)
-    description = String(allow_none=True)
-
-
-class JobPostingSchema(Schema):
-
-    id = String()
-
-
-class SkillSchema(Schema):
-
-    id = String()
-    links = List(Nested(LinkSchema))
-    skill = Dict()
-    proficiency_level = Dict()
-    name = String()
-
-
-class PositionSchema(Schema):
-
-    id = String()
-
-
-class AvailabilitySchema(Schema):
-
-    time_slots = List(Nested(List(String)))
-    time_zone = String()
-
-
-class CurrencySchema(Schema):
-
-    code = String()
-
-
-class CompensationSchema(Schema):
-    is_fulltime = Boolean()
-
-    hours_per_week = Integer()
-
-    is_salaried = Boolean()
-
-    pay_rate = Integer()
-
-    currency = Nested(CurrencySchema)
-
-
-class HireDetailsSchema(Schema):
-
-    company = Dict()
-    offer_date = DateTime()
-    accept_date = DateTime()
-    hire_date = DateTime()
-    start_date = DateTime()
-    full_time_equivalent = Integer()
-
-
-class EmployeeReferralSchema(Schema):
-
-    name = String(allow_none=True)
-    email = String(allow_none=True)
-    phone = String(allow_none=True)
-
-
-class NameSchema(Schema):
-    # Was using this but there are all kinds of language text fields
-
-    en_us = String(allow_none=True)
-    en_gb = String(allow_none=True)
-    en_ca = String(allow_none=True)
-
-
-class QuestionSchema(Schema):
-
-    id = String()
-    type = String()
-
-    text = Dict(allow_none=True)
-    potential_score = Integer(allow_none=True)
-    creation_method = String(allow_none=True)
-
-
-class ScreeningQuestionSchema(Schema):
-
-    id = String()
-    type = String()
-
-    question = Nested(QuestionSchema)
-
-    response = String(allow_none=True)
-    responses = List(String, allow_none=True)
-
-    is_correct = Boolean(allow_none=True)
-    is_disqualifying = Boolean(allow_none=True)
-    actual_score = Integer()
-    recruiter_declined_to_answer = Boolean()
-
-
-class CountryQuestionSchema(Schema):
-
-    id = String()
-    type = String()
-    question = Nested(QuestionSchema)
-    response = String(allow_none=True)
-    responses = List(Dict, allow_none=True)
-
-    # Docs don't show these but they come in
-    date = DateTime(allow_none=True)
-    name = String(allow_none=True)
-
-
-class JobBoardSchema(Schema):
-
-    id = String()
-
-
-class OriginSchema(Schema):
-
-    code = String()
-
-
-class MotivationSchema(Schema):
-
-    id = String()
-    links = List(Nested(LinkSchema))
-
-
-class OpportunitySchema(Schema):
-
-    id = String()
-
-
-class ApplicantSourceSchema(Schema):
-
-    id = String(allow_none=True) # Docs do not say nullable but the data is nulled.
-    name = Dict()
-
-
-class LicenseSchema(Schema):
-
-    id = String()
-    links = List(Nested(LinkSchema))
-
-
-class DegreeSchema(Schema):
-
-    id = String()
-    name = Dict()
-    href = String()
-    rel = String()
-
-
-class SchoolSchema(Schema):
-
-    id = String()
-    name = Dict()
-    links = List(Nested(LinkSchema))
-
-
-class MajorSchema(Schema):
-
-    id = String()
-    name = String()
-    links = List(Nested(LinkSchema))
-
-
-class MinorSchema(Schema):
-
-    id = String()
-    name = String()
-    links = List(Nested(LinkSchema))
-
-
-class EducationSchema(Schema):
-
-    id = String()
-    links = List(Nested(LinkSchema))
-    degree = Nested(DegreeSchema)
-    school = Nested(SchoolSchema)
-    major = Nested(MajorSchema, allow_none=True)
-    minor = Nested(MajorSchema, allow_none=True)
-    from_ = Nested(FromSchema, data_key='from', allow_none=True)
-    to = Nested(FromSchema, allow_none=True)
-    description = String(allow_none=True)
-
-
-class ApplicationSchema(Schema):
-
-    id = String()
-    links = List(Nested(LinkSchema))
-    external_apply_id = String()
-    updated_at = DateTime()
-    creator = Nested(CreatorSchema)
-    recruiting_process = Nested(RecruitingProcessSchema)
-    available_start_date = DateTime()
-    candidate = Nested(CandidateSchema)
-    work_experiences = List(Nested(WorkExperienceSchema))
-    is_processed = Boolean()
-    educations = List(Nested(EducationSchema))
-    job_posting = Nested(JobPostingSchema, allow_none=True)
-    skills = List(Nested(SkillSchema))
-    position = Nested(PositionSchema, allow_none=True)
-    availability = Dict(allow_none=True)
-    hire_details = Dict(allow_none=True)
-    employee_referral = Nested(EmployeeReferralSchema, allow_none=True)
-    country_question_responses = List(Dict, allow_none=True)
-    job_board = Nested(JobBoardSchema, allow_none=True)
-    applied_date = DateTime()
-    origin = Nested(OriginSchema, allow_none=True)
-    motivations = List(Nested(MotivationSchema))
-    opportunity = Nested(OpportunitySchema)
-    applicant_source = Nested(ApplicantSourceSchema)
-    licenses = List(Nested(LicenseSchema))
-    likes = List(String)
-    behaviors = List(String)
-    screening_question_responses = List(Nested(ScreeningQuestionSchema))
-    creation_method = String()
-    external_apply_id = String(allow_none=True)
-
-
-class Client:
-
-    def __init__(self, hostname, tenant, client_id, client_secret, access_token):
+download_re = re.compile(
+    r'http://service2.ultipro.com/AIR1013ATSG/api/applications/'
+    f'(?P<id1>[a-z0-9-]+)/documents/(?P<id2>[a-z0-9-]+)/download'
+)
+
+class APIClient:
+
+    signin_url = 'https://signin.ultipro.com/signin/oauth2/t/{tenant}/access_token'
+
+    def __init__(
+        self,
+        hostname,
+        tenant,
+        client_id,
+        client_secret,
+        access_token,
+    ):
         self.hostname = hostname
         self.tenant = tenant
         self.client_id = client_id
@@ -304,7 +42,37 @@ class Client:
             'Authorization': f'Bearer {self.access_token}'
         }
 
-    def raise_or_json(self, url):
+    @classmethod
+    def from_signin(cls, hostname, tenant, client_id, client_secret):
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "accept": "application/json",
+        }
+
+        # From email subject:
+        # "ATSG - Request for ats name Staging and Production Endpoints"
+        payload = {
+            'grant_type': 'client_credentials',
+            'client_id': client_id,
+            'client_secret': client_secret,
+        }
+        url = cls.signin_url.format(**locals())
+        response = requests.post(url, data=payload, headers=headers)
+        response.raise_for_status()
+
+        data = response.json()
+        access_token = data['access_token']
+
+        instance = cls(
+            hostname,
+            tenant,
+            client_id,
+            client_secret,
+            access_token,
+        )
+        return instance
+
+    def json_or_raise(self, url):
         response = requests.get(url, headers=self.headers)
         response.raise_for_status()
         return response.json()
@@ -314,41 +82,85 @@ class Client:
         if response.ok:
             return response.json()
 
+    def document_download_url(self, application_id, document_id):
+        download_url = (
+            f'https://{self.hostname}/talent/recruiting/v2/{self.tenant}'
+            f'/api/applications/{application_id}/documents/'
+            f'{document_id}/download'
+        )
+        return download_url
+
     def download(self, url, **kwargs):
         headers = {
             'Authorization': f'Bearer {self.access_token}'
         }
-        kwargs.update({'headers': headers})
         return requests.get(url, **kwargs)
+
+    def iter_applications_pages(self):
+        """
+        Iterate the pages of applications data.
+        """
+        url = (
+            f'https://{self.hostname}/talent/recruiting/v2/'
+            f'{self.tenant}/api/applications'
+        )
+        while url:
+            # The link data seems to give us a next-url that we just check for
+            # failure.
+            try:
+                response = requests.get(url, headers=self.headers)
+                response.raise_for_status()
+            except HTTPError:
+                break
+            yield response.json()
+            # The "next" page url is stuffed in the headers as a weird string
+            # under the "link" key.
+            link = response.headers.get('link', '')
+            # Search for the url inside <> for the next url page.
+            match = re.search(r'<([^>]+)>;\s*rel="next"', link)
+            if match:
+                url = match.group(1)
+                logger.info('next applications: %s', url)
+            else:
+                logger.info('end of applications: %s', url)
+                url = None
 
     def get_applicants(self):
         url = f'https://{self.hostname}/talent/recruiting/v2/{self.tenant}/api/applications'
-        return self.raise_or_json(url)
+        return self.json_or_raise(url)
 
     def get_candidate(self, candidate_id):
         url = (
-            f'https://{self.hostname}/talent/recruiting/v2/{self.tenant}/api'
-            '/candidates/{candidate_id}'
+            f'https://{self.hostname}/talent/recruiting/v2'
+            f'/{self.tenant}/api/candidates/{candidate_id}'
         )
-        return self.raise_or_json(url)
+        return self.json_or_raise(url)
 
     def get_candidates(self):
         url = f'https://{self.hostname}/talent/recruiting/v2/{self.tenant}/api/candidates'
-        return self.raise_or_json(url)
+        return self.json_or_raise(url)
 
     def get_applications(self):
         url = f'https://{self.hostname}/talent/recruiting/v2/{self.tenant}/api/applications'
-        return self.raise_or_json(url)
+        return self.json_or_raise(url)
 
     def get_applications_for_candidate(self, candidate_id):
         url = (
             f'https://{self.hostname}/talent/recruiting/v2/{self.tenant}'
             f'/api/applications/candidate/{candidate_id}'
         )
-        return self.raise_or_json(url)
+        return self.json_or_raise(url)
+
+    def get_document_download_url(self, application_id, document_id):
+        url = (
+            f'https://{self.hostname}/talent/recruiting/v2/{self.tenant}'
+            f'/api/applications/{application_id}/documents/'
+            f'{document_id}/download'
+        )
+        return url
 
 
-def get_signin(tenant, client_id, client_secret):
+def get_signin(tenant, client_id, client_secret, username, password):
     signin_url = f'https://signin.ultipro.com/signin/oauth2/t/{tenant}/access_token'
 
     headers = {
@@ -356,13 +168,12 @@ def get_signin(tenant, client_id, client_secret):
         "accept": "application/json",
     }
 
+    # From email subject:
+    # "ATSG - Request for ats name Staging and Production Endpoints"
     payload = {
         'grant_type': 'client_credentials',
         'client_id': client_id,
         'client_secret': client_secret,
-        # From email subject:
-        # "ATSG - Request for ats name Staging and Production Endpoints"
-        #'scope': scope,
     }
     response = requests.post(signin_url, data=payload, headers=headers)
     response.raise_for_status()
@@ -380,47 +191,69 @@ filename_keys = set([
     'file_name',
 ])
 
-def fix_https(href):
-    return href.replace('http:', 'https:')
+class FollowLinks:
 
-def save_links(client, parent, basedir):
-    links = parent.get('links', [])
-    if set(['document_type', 'file_name']).issubset(parent):
-        filename = parent['file_name']
-        # One of the links should be to a "Download"
-        for link_data in links:
-            if link_data['rel'] == 'Download':
-                href = link_data['href']
-                href = fix_https(href)
-                response = client.download(href, stream=True)
-                breakpoint()
-                if response:
-                    breakpoint()
-                else:
-                    logger.debug('%r %r', response, link_data)
-    elif links:
-        # Recurse down each link
-        for link_data in links:
-            href = link_data.get('href')
-            if href:
-                logger.debug('following link %s', href)
-                obj = client.try_json(href)
-                if isinstance(obj, list):
-                    for thing in obj:
-                        save_links(client, thing, basedir)
-                elif isinstance(obj, dict):
-                    newdir = os.path.join(basedir, link_data['rel'])
-                    save_links(client, obj, newdir)
+    def __init__(self, client, application):
+        self.client = client
+        self.application = application # data
+
+    def follow_links(self, obj, seen=None):
+        """
+        Recursively follow UltiPro-style HAL links.
+        Yields *all* dict objects encountered,
+        including nested ones, but never revisits the same URL twice.
+        """
+        if seen is None:
+            seen = set()
+
+        links = obj.get('links', [])
+        for link in links:
+            href = link.get('href')
+            if not href:
+                continue
+
+            # Avoid re-fetching the same link
+            if href in seen:
+                continue
+            seen.add(href)
+
+            data = self.client.try_json(href)
+            if data is None:
+                continue
+
+            # If the API returns a list, recurse into every element
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        yield item
+                        yield from self.follow_links(item, seen)
+
+            # If it’s a single dict, yield it and recurse
+            elif isinstance(data, dict):
+                yield data
+                yield from self.follow_links(data, seen)
+
+
+def is_document_object(obj):
+    return set(['document_type', 'file_name', 'id']).issubset(obj)
+
+def sftp_makedirs(sftp, remote_path, exist_ok=False):
+    """Recursively create directories on SFTP server."""
+    dirs = remote_path.strip('/').split('/')
+    path = ''
+    for dir_part in dirs:
+        path += f'/{dir_part}'
+        try:
+            sftp.mkdir(path)
+        except IOError:
+            # Directory probably exists, ignore
+            if not exist_ok:
+                raise
 
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('config')
     args = parser.parse_args(argv)
-
-    logging.basicConfig(
-        filename = 'instance/logging.txt',
-        level = logging.DEBUG,
-    )
 
     cp = RawConfigParser()
     cp.read(args.config)
@@ -434,27 +267,21 @@ def main(argv=None):
     userkey = appconfig['userkey']
     password = appconfig['password']
     username = appconfig['username']
+    csv_output = appconfig['csv_output']
+    attachments_dir = appconfig['attachments_dir']
+    attachment_path = appconfig['attachment_path']
 
-    application_schema = ApplicationSchema()
-
-    signin_data = get_signin(tenant, client_id, client_secret)
+    signin_data = get_signin(tenant, client_id, client_secret, username, password)
     access_token = signin_data['access_token']
 
-    client = Client(hostname, tenant, client_id, client_secret, access_token)
-
-    os.makedirs(apps_dir, exist_ok=True)
-
-    for application in client.get_applications():
-        app_dir = os.path.join(apps_dir, application['id'])
-        os.makedirs(app_dir, exist_ok=True)
-
-        json_path = os.path.join(app_dir, 'application.json') 
-
-        # Save downloaded data for application
-        with open(json_path, 'w') as json_file:
-            json.dump(application, json_file)
-
-        save_links(client, application, app_dir)
-
+    client = APIClient(
+        hostname,
+        tenant,
+        client_id,
+        client_secret,
+        access_token,
+        username,
+        password,
+    )
 if __name__ == "__main__":
     main()
