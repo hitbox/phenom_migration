@@ -131,14 +131,23 @@ class APIClient:
     def json_or_raise(self, url):
         return self.get(url).json()
 
-    def try_json(self, url):
+    def try_json(self, url, retries=3):
         time.sleep(0.2)
-        try:
-            response = self.get(url)
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            logger.warning('Failed %s', e)
-            return None
+        for attempt in range(retries):
+            try:
+                response = self.get(url)
+                data = safe_json_decode(response)
+                if data is not None:
+                    return data
+                logger.warning(
+                    'Failed json decode from %s, attempt %s/%s', url, attempt+1, retries)
+                time.sleep(2 ** attempt)
+            except requests.exceptions.RequestException as e:
+                logger.warning('Failed %s, attempt %s/%s', e, attempt+1, retries)
+                if attempt < retries - 1:
+                    time.sleep(2 ** attempt)
+        logger.error('All retries exhausted for %s', url)
+        return None
 
     def download_file(self, url, dest_path):
         for attempt in range(5):
@@ -223,37 +232,39 @@ class APIClient:
         )
         return url
 
+    def iter_applications_and_candidates(self, processed_applications=None):
+        if processed_applications is None:
+            processed_applications = set()
 
-def get_signin(tenant, client_id, client_secret, username, password):
-    signin_url = f'https://signin.ultipro.com/signin/oauth2/t/{tenant}/access_token'
+        for applications in self.iter_applications_pages():
+            for application in applications:
+                application_id = application['id']
 
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "accept": "application/json",
-    }
+                if application_id in processed_applications:
+                    logger.info(
+                        'Skipping already processed application %s', application_id)
+                    continue
 
-    # From email subject:
-    # "ATSG - Request for ats name Staging and Production Endpoints"
-    payload = {
-        'grant_type': 'client_credentials',
-        'client_id': client_id,
-        'client_secret': client_secret,
-    }
-    response = requests.post(signin_url, data=payload, headers=headers)
-    response.raise_for_status()
+                processed_applications.add(application_id)
 
-    data = response.json()
-    return data
+                candidates = application.get('candidate', {})
+                if not isinstance(candidates, list):
+                    candidates = [candidates]
 
-def deep_get(dict_, *keys):
-    for key in keys:
-        dict_ = dict_.get(key)
-    return dict_
+                for candidate in candidates:
+                    links = FollowLinks(self, application)
+                    for document in links.follow_links(application):
+                        if is_document_object(document):
 
-filename_keys = set([
-    'document_type',
-    'file_name',
-])
+                            candidate_data = self.get_candidate(candidate['id'])
+
+                            candidate_context = {
+                                'candidate_data': candidate_data,
+                                'application': application,
+                                'document': document,
+                            }
+                            yield candidate_context
+
 
 class FollowLinks:
 
@@ -335,3 +346,111 @@ def sanitize_filename(filename: str, max_length: int = 255) -> str:
         sanitized = sanitized[:max_length]
 
     return sanitized
+
+def safe_json_decode(response):
+    """
+    Safely decode JSON with fallback error handling.
+    """
+    try:
+        return response.json()
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error for URL {response.url}")
+        logger.error(f"Response status: {response.status_code}")
+        logger.error(f"Response text (first 500 chars): {response.text[:500]}")
+        logger.error(f"Decode error: {e}")
+        return None
+
+def scrape_ukg_api(client, writer, attachment_path, checkpoint_path=None):
+    """
+    Scrape UKG API, download documents, and write to CSV.
+    """
+    processed_applications = set()
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        with open(checkpoint_path, 'r') as checkpoint_file:
+            checkpoint = json.load(checkpoint_file)
+            processed_applications = set(checkpoint.get('processed', []))
+        logger.info('Resumed: %s applications already processed', len(processed_applications))
+
+    checkpoint_counter = 0
+    for applications in client.iter_applications_pages():
+        for application in applications:
+            application_id = application['id']
+
+            if application_id in processed_applications:
+                logger.info('Skipping already processed application %s', application_id)
+                continue
+
+            try:
+                candidates = application.get('candidate', {})
+                if not isinstance(candidates, list):
+                    candidates = [candidates]
+
+                for candidate in candidates:
+                    links = FollowLinks(client, application)
+                    for document in links.follow_links(application):
+                        if is_document_object(document):
+                            filename = sanitize_filename(document['file_name'])
+                            download_path = attachment_path.format(
+                                application=application, 
+                                filename=filename
+                            )
+                            
+                            # Download file if it doesn't exist
+                            if os.path.exists(download_path):
+                                logger.info('File already exists: %s', download_path)
+                            else:
+                                download_url = client.get_document_download_url(
+                                    application_id, 
+                                    document['id']
+                                )
+                                os.makedirs(os.path.dirname(download_path), exist_ok=True)
+                                client.download_file(download_url, download_path)
+                                logger.info('Downloaded: %s', download_path)
+
+                            # Always write CSV row for complete record
+                            candidate_data = client.get_candidate(candidate['id'])
+                            email = candidate_data['contact_info'].get('email', None)
+                            candidate_name = candidate.get('name', {})
+                            writer.writerow({
+                                'candidate_id': candidate.get('id'),
+                                'first_name': candidate_name.get('first'),
+                                'last_name': candidate_name.get('last'),
+                                'email': email,
+                                'date_created': application.get('applied_date'),
+                                'date_updated': application.get('updated_at'),
+                                'fileName': os.path.basename(download_path),
+                            })
+
+                # Mark application as processed
+                processed_applications.add(application_id)
+                checkpoint_counter += 1
+
+                # Save checkpoint every 10 applications
+                if checkpoint_path and checkpoint_counter % 10 == 0:
+                    with open(checkpoint_path, 'w') as f:
+                        json.dump({'processed': list(processed_applications)}, f)
+                    logger.info(
+                        'Checkpoint saved: %s applications processed',
+                        len(processed_applications)
+                    )
+
+            except Exception as e:
+                logger.error(
+                    "Error processing application %s: %s",
+                    application_id,
+                    exc_info=True
+                )
+                # Save checkpoint before potentially crashing
+                if checkpoint_path:
+                    with open(checkpoint_path, 'w') as f:
+                        json.dump({'processed': list(processed_applications)}, f)
+                raise
+
+    # Final checkpoint save
+    if checkpoint_path:
+        with open(checkpoint_path, 'w') as f:
+            json.dump({'processed': list(processed_applications)}, f)
+        logger.info(
+            'Final checkpoint saved: %s applications processed',
+            len(processed_applications)
+        )
