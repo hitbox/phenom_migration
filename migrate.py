@@ -1,21 +1,19 @@
 import argparse
+import time
 import csv
 import json
 import logging
 import os
 import re
-import requests
+import time
 
 from configparser import RawConfigParser
 from pprint import pprint
 from requests.exceptions import HTTPError
 
-logger = logging.getLogger('migrate')
+import requests
 
-download_re = re.compile(
-    r'http://service2.ultipro.com/AIR1013ATSG/api/applications/'
-    f'(?P<id1>[a-z0-9-]+)/documents/(?P<id2>[a-z0-9-]+)/download'
-)
+logger = logging.getLogger('migrate')
 
 class APIClient:
 
@@ -28,19 +26,72 @@ class APIClient:
         client_id,
         client_secret,
         access_token,
+        expires_at=None,
     ):
         self.hostname = hostname
         self.tenant = tenant
         self.client_id = client_id
         self.client_secret = client_secret
         self.access_token = access_token
+        self.expires_at = expires_at
 
-    @property
-    def headers(self):
-        return {
+        self.session = requests.Session()
+        self.session.headers.update({
             'accept': 'application/json',
-            'Authorization': f'Bearer {self.access_token}'
+        })
+        if access_token:
+            self.session.headers['Authorization'] = f'Bearer {access_token}'
+
+    def refresh_access_token(self):
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "accept": "application/json",
         }
+
+        payload = {
+            'grant_type': 'client_credentials',
+            'client_id': self.client_id,
+            'client_secret': self.client_secret,
+        }
+
+        url = self.signin_url.format(tenant=self.tenant)
+        response = requests.post(url, data=payload, headers=headers)
+        response.raise_for_status()
+
+        data = response.json()
+
+        self.access_token = data['access_token']
+        expires_in = data.get('expires_in')
+        if expires_in:
+            self.expires_at = time.time() + expires_in
+
+        self.session.headers['Authorization'] = f'Bearer {self.access_token}'
+
+        logger.info("Refreshed UltiPro access token")
+
+    def get(self, url, **kwargs):
+        self.ensure_token()
+
+        for attempt in range(5):
+            try:
+                response = self.session.get(url, timeout=10, **kwargs)
+                if response.status_code == 401:
+                    logger.warning("401 received, refreshing token and retrying")
+                    self.refresh_access_token()
+                    continue  # retry immediately
+                response.raise_for_status()
+                return response
+            except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
+                logger.warning(f"Connection error on attempt {attempt+1}/5 for URL: {url}: {e}")
+                time.sleep(2 ** attempt)  # exponential backoff
+        raise requests.exceptions.ConnectionError(f"Failed to GET {url} after retries")
+
+    def ensure_token(self):
+        # Refresh if token is missing or expires within 60 seconds
+        if not self.access_token or (
+            self.expires_at and time.time() > self.expires_at - 60
+        ):
+            self.refresh_access_token()
 
     @classmethod
     def from_signin(cls, hostname, tenant, client_id, client_secret):
@@ -63,38 +114,50 @@ class APIClient:
         data = response.json()
         access_token = data['access_token']
 
+        expires_at = None
+        if 'expires_in' in data:
+            expires_at = time.time() + data['expires_in']
+
         instance = cls(
             hostname,
             tenant,
             client_id,
             client_secret,
             access_token,
+            expires_at = expires_at,
         )
         return instance
 
     def json_or_raise(self, url):
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-        return response.json()
+        return self.get(url).json()
 
     def try_json(self, url):
-        response = requests.get(url, headers=self.headers)
-        if response.ok:
+        time.sleep(0.2)
+        try:
+            response = self.get(url)
             return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.warning('Failed %s', e)
+            return None
 
-    def document_download_url(self, application_id, document_id):
-        download_url = (
-            f'https://{self.hostname}/talent/recruiting/v2/{self.tenant}'
-            f'/api/applications/{application_id}/documents/'
-            f'{document_id}/download'
-        )
-        return download_url
+    def download_file(self, url, dest_path):
+        for attempt in range(5):
+            try:
+                with self.session.get(url, stream=True, timeout=20) as r:
+                    r.raise_for_status()
+                    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                    with open(dest_path, 'wb') as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                return
+            except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
+                logger.warning(f"Download failed attempt {attempt+1}/5: {e}")
+                time.sleep(2 ** attempt)
+        raise requests.exceptions.ConnectionError(f"Failed to download {url} after retries")
 
     def download(self, url, **kwargs):
-        headers = {
-            'Authorization': f'Bearer {self.access_token}'
-        }
-        return requests.get(url, **kwargs)
+        return self.get(url, **kwargs)
 
     def iter_applications_pages(self):
         """
@@ -108,10 +171,11 @@ class APIClient:
             # The link data seems to give us a next-url that we just check for
             # failure.
             try:
-                response = requests.get(url, headers=self.headers)
+                response = self.get(url)
                 response.raise_for_status()
             except HTTPError:
                 break
+            logger.info('applications json from url=%s', url)
             yield response.json()
             # The "next" page url is stuffed in the headers as a weird string
             # under the "link" key.
@@ -250,38 +314,24 @@ def sftp_makedirs(sftp, remote_path, exist_ok=False):
             if not exist_ok:
                 raise
 
-def main(argv=None):
-    parser = argparse.ArgumentParser()
-    parser.add_argument('config')
-    args = parser.parse_args(argv)
+def sanitize_filename(filename: str, max_length: int = 255) -> str:
+    # Replace illegal characters with underscore
+    sanitized = re.sub(r'[\\/:*?"<>|]', '_', filename)
 
-    cp = RawConfigParser()
-    cp.read(args.config)
-    appconfig = cp['migrate']
+    # Strip leading/trailing spaces and dots
+    sanitized = sanitized.strip(' .')
 
-    client_id = appconfig['client_id']
-    apps_dir = appconfig['apps_dir']
-    hostname = appconfig['hostname']
-    client_secret = appconfig['client_secret']
-    tenant = appconfig['tenant']
-    userkey = appconfig['userkey']
-    password = appconfig['password']
-    username = appconfig['username']
-    csv_output = appconfig['csv_output']
-    attachments_dir = appconfig['attachments_dir']
-    attachment_path = appconfig['attachment_path']
+    # Prevent reserved Windows names
+    reserved_names = {
+        "CON","PRN","AUX","NUL",
+        *(f"COM{i}" for i in range(1, 10)),
+        *(f"LPT{i}" for i in range(1, 10))
+    }
+    if sanitized.upper() in reserved_names:
+        sanitized = f"_{sanitized}"
 
-    signin_data = get_signin(tenant, client_id, client_secret, username, password)
-    access_token = signin_data['access_token']
+    # Truncate to max length
+    if len(sanitized) > max_length:
+        sanitized = sanitized[:max_length]
 
-    client = APIClient(
-        hostname,
-        tenant,
-        client_id,
-        client_secret,
-        access_token,
-        username,
-        password,
-    )
-if __name__ == "__main__":
-    main()
+    return sanitized
