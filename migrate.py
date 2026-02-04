@@ -317,6 +317,35 @@ class FollowLinks:
                 yield from self.follow_links(data, seen, rels=rels)
 
 
+class UKGDictWriter(csv.DictWriter):
+    fieldnames = [
+        'candidate_id',
+        'first_name',
+        'last_name',
+        'email',
+        'date_created',
+        'date_updated',
+        'fileName',
+    ]
+
+    def __init__(self, csv_file, **kwargs):
+        kwargs.setdefault('fieldnames', self.fieldnames)
+        super().__init__(csv_file, **kwargs)
+
+    def write_ukg_row(self, candidate, candidate_data, application, download_path):
+        email = candidate_data['contact_info'].get('email')
+        candidate_name = candidate.get('name', {})
+        super().writerow({
+            'candidate_id': candidate.get('id'),
+            'first_name': candidate_name.get('first'),
+            'last_name': candidate_name.get('last'),
+            'email': email,
+            'date_created': application.get('applied_date'),
+            'date_updated': application.get('updated_at'),
+            'fileName': os.path.basename(download_path),
+        })
+
+
 def is_document_object(obj):
     return set(['document_type', 'file_name', 'id']).issubset(obj)
 
@@ -373,6 +402,8 @@ def scrape_ukg_api(client, writer, attachment_path, checkpoint_path=None, skip_e
     Scrape UKG API, download documents, and write to CSV.
     """
     processed_applications = set()
+
+    # Load checkpoint data if exists.
     if checkpoint_path and os.path.exists(checkpoint_path):
         with open(checkpoint_path, 'r') as checkpoint_file:
             checkpoint = json.load(checkpoint_file)
@@ -406,17 +437,12 @@ def scrape_ukg_api(client, writer, attachment_path, checkpoint_path=None, skip_e
 
                             # Always write CSV row for complete record
                             candidate_data = client.get_candidate(candidate['id'])
-                            email = candidate_data['contact_info'].get('email', None)
-                            candidate_name = candidate.get('name', {})
-                            writer.writerow({
-                                'candidate_id': candidate.get('id'),
-                                'first_name': candidate_name.get('first'),
-                                'last_name': candidate_name.get('last'),
-                                'email': email,
-                                'date_created': application.get('applied_date'),
-                                'date_updated': application.get('updated_at'),
-                                'fileName': os.path.basename(download_path),
-                            })
+                            writer.write_ukg_row(
+                                candidate,
+                                candidate_data,
+                                application,
+                                download_path,
+                            )
 
                             # Download file if it doesn't exist
                             if skip_existing and os.path.exists(download_path):
