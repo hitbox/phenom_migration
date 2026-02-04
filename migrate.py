@@ -272,7 +272,7 @@ class FollowLinks:
         self.client = client
         self.application = application # data
 
-    def follow_links(self, obj, seen=None):
+    def follow_links(self, obj, seen=None, rels=None):
         """
         Recursively follow UltiPro-style HAL links.
         Yields *all* dict objects encountered,
@@ -284,14 +284,22 @@ class FollowLinks:
         links = obj.get('links', [])
         for link in links:
             href = link.get('href')
+            rel = link.get('rel')
             if not href:
+                logging.info('Skipping empty href')
+                continue
+
+            if rels and rel not in rels:
+                logging.info('Skip rel=%r not in %r', rel, rels)
                 continue
 
             # Avoid re-fetching the same link
             if href in seen:
+                logging.info('Skipping seen href %s', href)
                 continue
             seen.add(href)
 
+            logger.info('Getting json for rel=%r, href=%r', rel, href)
             data = self.client.try_json(href)
             if data is None:
                 continue
@@ -301,12 +309,12 @@ class FollowLinks:
                 for item in data:
                     if isinstance(item, dict):
                         yield item
-                        yield from self.follow_links(item, seen)
+                        yield from self.follow_links(item, seen, rels=rels)
 
             # If it’s a single dict, yield it and recurse
             elif isinstance(data, dict):
                 yield data
-                yield from self.follow_links(data, seen)
+                yield from self.follow_links(data, seen, rels=rels)
 
 
 def is_document_object(obj):
@@ -360,7 +368,7 @@ def safe_json_decode(response):
         logger.error(f"Decode error: {e}")
         return None
 
-def scrape_ukg_api(client, writer, attachment_path, checkpoint_path=None):
+def scrape_ukg_api(client, writer, attachment_path, checkpoint_path=None, skip_existing=False):
     """
     Scrape UKG API, download documents, and write to CSV.
     """
@@ -385,27 +393,16 @@ def scrape_ukg_api(client, writer, attachment_path, checkpoint_path=None):
                 if not isinstance(candidates, list):
                     candidates = [candidates]
 
+                rels = set(['documents'])
                 for candidate in candidates:
                     links = FollowLinks(client, application)
-                    for document in links.follow_links(application):
+                    for document in links.follow_links(application, rels=rels):
                         if is_document_object(document):
                             filename = sanitize_filename(document['file_name'])
                             download_path = attachment_path.format(
                                 application=application, 
                                 filename=filename
                             )
-                            
-                            # Download file if it doesn't exist
-                            if os.path.exists(download_path):
-                                logger.info('File already exists: %s', download_path)
-                            else:
-                                download_url = client.get_document_download_url(
-                                    application_id, 
-                                    document['id']
-                                )
-                                os.makedirs(os.path.dirname(download_path), exist_ok=True)
-                                client.download_file(download_url, download_path)
-                                logger.info('Downloaded: %s', download_path)
 
                             # Always write CSV row for complete record
                             candidate_data = client.get_candidate(candidate['id'])
@@ -420,6 +417,20 @@ def scrape_ukg_api(client, writer, attachment_path, checkpoint_path=None):
                                 'date_updated': application.get('updated_at'),
                                 'fileName': os.path.basename(download_path),
                             })
+
+                            # Download file if it doesn't exist
+                            if skip_existing and os.path.exists(download_path):
+                                logger.info('File already exists: %s', download_path)
+                            else:
+                                download_url = client.get_document_download_url(
+                                    application_id,
+                                    document['id']
+                                )
+                                os.makedirs(os.path.dirname(download_path), exist_ok=True)
+                                logger.info('Getting %s', download_url)
+                                client.download_file(download_url, download_path)
+                                logger.info('Downloaded: %s', download_path)
+
 
                 # Mark application as processed
                 processed_applications.add(application_id)
