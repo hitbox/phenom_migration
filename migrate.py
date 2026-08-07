@@ -1,25 +1,38 @@
 import argparse
 import calendar
+import configparser
 import csv
+import heapq
 import json
-import logging
+import logging.config
 import os
 import re
 import time
 
+from operator import itemgetter
 from configparser import RawConfigParser
 from datetime import datetime
 from datetime import timezone
 from pprint import pprint
 from requests.exceptions import HTTPError
 
+import marshmallow as mm
 import paramiko
 import requests
 
-logger = logging.getLogger(__name__)
+from parse_link import parse_headers_links
+from schema import ApplicationSchema
+from schema import CandidateSchema
+from schema import DocumentSchema
+from schema import LinkResultSchema
+from schema import LinkSchema
+
+logger = logging.getLogger('migrate')
+
 
 class DownloadFailed(Exception):
     pass
+
 
 class APIClient:
 
@@ -212,7 +225,11 @@ class APIClient:
             # The link data seems to give us a next-url that we just check for
             # failure.
             try:
-                response = self.get(url, params=query)
+                if query:
+                    response = self.get(url, params=query)
+                    query = None
+                else:
+                    response = self.get(url)
                 response.raise_for_status()
             except HTTPError:
                 break
@@ -220,16 +237,19 @@ class APIClient:
             yield response.json()
             # The "next" page url is stuffed in the headers as a weird string
             # under the "link" key.
-            link = response.headers.get('link', '')
-            # Search for the url inside <> for the next url page.
-            match = re.search(r'<([^>]+)>;\s*rel="next"', link)
-            if match:
-                url = match.group(1)
-                # Only send query for first request to avoid appending the params again and again.
-                query = None
-                logger.info('next applications: %s', url)
+            link_string = response.headers.get('link', '')
+
+            links = parse_headers_links(link_string)
+            for data in links:
+                if data['rel'] == 'next':
+                    # leak into while loop
+                    url = data['href']
+                    logger.info('next applications: %s', url)
+                    break
             else:
+                # "next" key not found.
                 logger.info('end of applications: %s', url)
+                # None to stop loop
                 url = None
 
     def get_application(self, application_id):
@@ -288,7 +308,7 @@ class APIClient:
 
                 for candidate in candidates:
                     links = FollowLinks(self, application)
-                    for document in links.follow_links(application):
+                    for document in links.walk_links(application):
                         if is_document_object(document):
                             candidate_data = self.get_candidate(candidate['id'])
                             candidate_context = {
@@ -301,81 +321,109 @@ class APIClient:
 
 class FollowLinks:
 
-    def __init__(self, client, application):
-        self.client = client
-        self.application = application # data
+    link_schema_class = LinkSchema
+    link_result_schema_class = LinkResultSchema
 
-    def follow_links(self, obj, seen=None, rels=None):
+    def __init__(
+        self,
+        client,
+        allow_rels,
+        link_schema,
+        link_result_schema,
+    ):
+        self.client = client
+        self.allow_rels = allow_rels
+        self.link_schema = link_schema
+        self.link_result_schema = link_result_schema
+
+    def walk_links(self, obj, seen=None):
         """
         Recursively follow UltiPro-style HAL links.
         Yields *all* dict objects encountered,
         including nested ones, but never revisits the same URL twice.
         """
+        # Links come from the given object first and then
+        # from response headers.
         if seen is None:
             seen = set()
 
-        links = obj.get('links', [])
-        for link in links:
-            href = link.get('href')
-            rel = link.get('rel')
-            if not href:
-                logging.info('Skipping empty href')
-                continue
+        links = self.link_schema.load(obj['links'], many=True)
+        for link_json in links:
+            link_data = self.link_schema.load(link_json)
+            href = link_data['href']
+            rel = link_data['rel']
 
-            if rels and rel not in rels:
-                logging.info('Skip rel=%r not in %r', rel, rels)
+            if self.allow_rels and rel not in self.allow_rels:
+                logger.info('Skip rel=%r', rel)
                 continue
 
             # Avoid re-fetching the same link
             if href in seen:
-                logging.info('Skipping seen href %s', href)
+                logger.info('Skipping seen href %s', href)
                 continue
             seen.add(href)
 
             logger.info('Getting json for rel=%r, href=%r', rel, href)
-            data = self.client.try_json(href)
-            if data is None:
+            result_json = self.client.try_json(href)
+
+            if result_json is None:
+                logger.info('No data from %r', href)
                 continue
 
-            # If the API returns a list, recurse into every element
-            if isinstance(data, list):
-                for item in data:
-                    if isinstance(item, dict):
-                        yield item
-                        yield from self.follow_links(item, seen, rels=rels)
+            # Pretty sure it's always a list.
+            result_list = self.link_result_schema.load(result_json, many=True)
+            for item in result_list:
+                if isinstance(item, dict):
+                    yield item
+                    yield from self.walk_links(item, seen)
 
-            # If it’s a single dict, yield it and recurse
-            elif isinstance(data, dict):
-                yield data
-                yield from self.follow_links(data, seen, rels=rels)
+
+class UKGRowMapper:
+
+    DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
+
+    MAPPING = {
+        'Candidate_ID': lambda self, candidate, application: candidate['id'],
+        'Candidate_FirstName': lambda self, candidate, application: candidate['name']['first'],
+        'Candidate_LastName': lambda self, candidate, application: candidate['name']['last'],
+        'Candidate_EmailID_1_email': lambda self, candidate, application: candidate['contact_info']['email'],
+        'Candidate_DateCreated': lambda self, candidate, application: self.format_phenom_datetime(candidate['created_at']),
+        'date_updated': lambda self, candidate, application: self.format_phenom_datetime(application['updated_at']),
+        'Candidate_Application_ApplicationID': lambda self, candidate, application: application['id'],
+        'Candidate_Application_JobID': lambda self, candidate, application: application['opportunity']['id'],
+        'Candidate_Application_ApplicationDateCreated': lambda self, candidate, application: self.format_phenom_datetime(application['applied_date']),
+        'Candidate_Application_ApplicationDateUpdated': lambda self, candidate, application: self.format_phenom_datetime(application['updated_at']),
+        'Candidate_Application_ApplicationStatus': lambda self, candidate, application: application['creation_method'],
+        'Application Source': lambda self, candidate, application: safedrill(application, 'applicant_source', 'name', 'en_us'),
+        'Candidate_Location_City': lambda self, candidate, application: safedrill(candidate, 'contact_info', 'address', 'city'),
+        'Candidate_Location_State': lambda self, candidate, application: safedrill(candidate, 'contact_info', 'address', 'state', 'name', 'en_us'),
+        'Candidate_Location_Country': lambda self, candidate, application: safedrill(candidate, 'contact_info', 'address', 'country', 'code'),
+        'Candidate_PrimaryPhoneNumber': lambda self, candidate, application: safedrill(candidate, 'contact_info', 'phone', 'primary'),
+        #'fileName': lambda self, candidate, application: os.path.basename(download_path),
+        'fileName': lambda self, candidate, application: None, # needs to exist for DictWriter fieldnames.
+        'Parsable': lambda self, candidate, application: 'Yes', # IDK, they asked for this
+    }
+
+    def get_fieldnames(self):
+        return list(self.MAPPING.keys())
+
+    def format_date(self, dt):
+        if isinstance(dt, datetime):
+            return dt.strftime(self.DATE_FORMAT)
+
+    def format_phenom_datetime(self, dt):
+        return f"{dt:%Y-%m-%dT%H:%M:%S}.{dt.microsecond // 10000:02d}Z"
+
+    def map_row(self, candidate, application):
+        result = {csvkey: func(self, candidate, application)
+                  for csvkey, func in self.MAPPING.items()}
+        return result
+        
 
 
 class UKGDictWriter(csv.DictWriter):
 
-    fieldnames = [
-        'Candidate_ID',
-        'Candidate_FirstName',
-        'Candidate_LastName',
-        'Candidate_EmailID_1_email',
-        'Candidate_DateCreated',
-        'date_updated',
-        'Candidate_Application_ApplicationID',
-        'Candidate_Application_JobID',
-        'Candidate_Application_ApplicationDateCreated',
-        'Candidate_Application_ApplicationDateUpdated',
-        'Candidate_Application_ApplicationStatus',
-        'Application Source',
-        'Candidate_Location_City',
-        'Candidate_Location_State',
-        'Candidate_Location_Country',
-        'Candidate_PrimaryPhoneNumber',
-        'fileName',
-        'Parsable',
-        'download_status',
-    ]
-
     def __init__(self, csv_file, **kwargs):
-        kwargs.setdefault('fieldnames', self.fieldnames)
         super().__init__(csv_file, **kwargs)
         self.csv_file = csv_file
 
@@ -411,16 +459,16 @@ class UKGDictWriter(csv.DictWriter):
             phone = None
         row_data = {
             'Candidate_ID': candidate.get('id'),
-            'Candidate_FirstName': candidate_name.get('first'),
+                'Candidate_FirstName': candidate_name.get('first'),
             'Candidate_LastName': candidate_name.get('last'),
             'Candidate_EmailID_1_email': email,
             'Candidate_DateCreated': candidate_data['created_at'],
-            'date_updated': application.get('updated_at'),
+            'date_updated': application['updated_at'],
             'Candidate_Application_ApplicationID': application['id'],
             'Candidate_Application_JobID': job_id,
-            'Candidate_Application_ApplicationDateCreated': application.get('applied_date'),
-            'Candidate_Application_ApplicationDateUpdated': application.get('updated_at'),
-            'Candidate_Application_ApplicationStatus': application_data.get('creation_method'),
+            'Candidate_Application_ApplicationDateCreated': application['applied_date'],
+            'Candidate_Application_ApplicationDateUpdated': application['updated_at'],
+            'Candidate_Application_ApplicationStatus': application_data['creation_method'],
             'Application Source': application_source,
             'Candidate_Location_City': city,
             'Candidate_Location_State': state,
@@ -433,7 +481,25 @@ class UKGDictWriter(csv.DictWriter):
         super().writerow(row_data)
 
 
+def safedrill(dict_, *keys, abort_none=True, use_last_good=True):
+    value = dict_
+    for key in keys:
+        if abort_none:
+            if value is None:
+                break
+            else:
+                # let raise TypeError
+                pass
+        if key in value:
+            value = value[key]
+    return value
+
+def removewrap(string, wrapping_chars):
+    prefix, suffix = wrapping_chars
+    return string.removeprefix(prefix).removesuffix(suffix)
+
 def is_document_object(obj):
+    # Has all these keys.
     return set(['document_type', 'file_name', 'id']).issubset(obj)
 
 def sftp_makedirs(sftp, remote_path, exist_ok=False):
@@ -490,135 +556,6 @@ def safe_json_decode(response):
         logger.error(f"Decode error: {e}")
         return None
 
-def scrape_ukg_api(client, writer, attachment_path, checkpoint_path=None, skip_existing=False, query=None):
-    """
-    Scrape UKG API, download documents, and write to CSV.
-    """
-    processed_applications = set()
-
-    # Load checkpoint data if exists.
-    if checkpoint_path and os.path.exists(checkpoint_path):
-        with open(checkpoint_path, 'r') as checkpoint_file:
-            checkpoint = json.load(checkpoint_file)
-            processed_applications = set(checkpoint.get('processed', []))
-        logger.info('Resumed: %s applications already processed', len(processed_applications))
-
-    checkpoint_counter = 0
-    rows_written = 0
-    for applications in client.iter_applications_pages(query=query):
-        for application in applications:
-            application_id = application['id']
-            try:
-                application_data = client.get_application(application_id)
-            except:
-                logger.exception('An error occurred while getting application')
-
-            if application_id in processed_applications:
-                logger.info('Skipping already processed application %s', application_id)
-                continue
-
-            try:
-                candidates = application.get('candidate', {})
-                if not isinstance(candidates, list):
-                    candidates = [candidates]
-
-                rels = set(['documents'])
-                for candidate in candidates:
-                    # Follow links for documents
-                    links = FollowLinks(client, application)
-                    for document in links.follow_links(application, rels=rels):
-                        if is_document_object(document):
-                            filename = sanitize_filename(document['file_name'])
-                            # Add local path to filename from format string.
-                            download_path = attachment_path.format(
-                                application=application,
-                                filename=filename
-                            )
-
-                            download_status = None
-                            try:
-                                # Download file if it doesn't exist
-                                if skip_existing and os.path.exists(download_path):
-                                    logger.info('File already exists: %s', download_path)
-                                else:
-                                    # Try to download file as is by given
-                                    # filename. Sanitize filename if it throws
-                                    # an error. Open written file and read a
-                                    # byte; and stat file to confirm it will be
-                                    # readable again.
-                                    download_url = client.get_document_download_url(
-                                        application_id,
-                                        document['id']
-                                    )
-                                    os.makedirs(os.path.dirname(download_path), exist_ok=True)
-                                    download_status = None
-                                    try:
-                                        client.download_file(download_url, download_path)
-                                    except OSError:
-                                        download_path = sanitize_filename(download_path)
-                                        client.download_file(download_url, download_path)
-                                        download_status = 'success after sanitize'
-                                    try:
-                                        with open(download_path, 'rb') as test_file:
-                                            # test reading a byte to verify the file can be read back
-                                            test_file.read(1)
-                                        os.stat(download_path)
-                                    except FileNotFoundError as e:
-                                        download_status = str(e)
-                                    logger.info('Downloaded: %s', download_path)
-                            except DownloadFailed as e:
-                                download_status = str(e)
-                            finally:
-                                # Always write CSV row whether file was skipped for existing or not.
-                                candidate_data = client.get_candidate(candidate['id'])
-                                writer.write_ukg_row(
-                                    candidate,
-                                    candidate_data,
-                                    application,
-                                    application_data,
-                                    download_path,
-                                    download_status,
-                                )
-                                rows_written += 1
-                                if rows_written % 100 == 0:
-                                    writer.csv_file.flush()
-
-                # Mark application as processed
-                processed_applications.add(application_id)
-                checkpoint_counter += 1
-
-                # Save checkpoint every 10 applications
-                if checkpoint_path and checkpoint_counter % 10 == 0:
-                    with open(checkpoint_path, 'w') as f:
-                        json.dump({'processed': list(processed_applications)}, f)
-                    logger.info(
-                        'Checkpoint saved: %s applications processed',
-                        len(processed_applications)
-                    )
-
-            except Exception as e:
-                logger.error(
-                    "Error processing application: %s",
-                    application_id,
-                    exc_info=True
-                )
-                # Save checkpoint before potentially crashing
-                if checkpoint_path:
-                    with open(checkpoint_path, 'w') as f:
-                        json.dump({'processed': list(processed_applications)}, f)
-                raise
-
-    # Final checkpoint save
-    if checkpoint_path:
-        with open(checkpoint_path, 'w') as f:
-            json.dump({'processed': list(processed_applications)}, f)
-        logger.info(
-            'Final checkpoint saved: %s applications processed',
-            len(processed_applications)
-        )
-    # Return True for complete run because we're eating the exceptions.
-    return True
-
 def get_sftp(options):
     host = options['host']
     port = options['port']
@@ -629,6 +566,16 @@ def get_sftp(options):
 
     sftp = paramiko.SFTPClient.from_transport(transport)
     return sftp
+
+def replace_time_part(dt, **kwargs):
+    """
+    Replace the time parts of a datetime, by default with zeros.
+    """
+    kwargs.setdefault('hour', 0)
+    kwargs.setdefault('minute', 0)
+    kwargs.setdefault('second', 0)
+    kwargs.setdefault('microsecond', 0)
+    return dt.replace(**kwargs)
 
 def months_ago(dt, months):
     year = dt.year
@@ -643,16 +590,157 @@ def months_ago(dt, months):
     last_day = calendar.monthrange(year, month)[1]
     day = min(dt.day, last_day)
 
-    return dt.replace(year=year, month=month, day=day)
+    kwargs = {
+        'year': year,
+        'month': month,
+        'day': day,
+    }
+    return dt.replace(**kwargs)
+
+def ensure_utc(dt):
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt
 
 def iso8601_millis(dt):
     """
     Format a datetime as ISO-8601 UTC with milliseconds, e.g.:
     2016-12-21T18:44:03.356Z
     """
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    else:
-        dt = dt.astimezone(timezone.utc)
-
     return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+def json_dump_line(obj, file, **kwargs):
+    json.dump(document_dump, output_file, **kwargs)
+    output_file.write('\n')
+
+def json_dump_line_pretty(obj, file, **kwargs):
+    kwargs.setdefault('indent', 4)
+    return json_dump_line(obj, file, **kwargs)
+
+def realmain(config, num_months_ago=None):
+    cp = configparser.ConfigParser()
+    cp.read(config)
+
+    if set(['loggers', 'handlers', 'formatters']).issubset(cp):
+        # logging available from config file, use it.
+        logging.config.fileConfig(cp)
+
+    now = datetime.now()
+
+    csv_path = cp['scrape']['csv_path'].format(now=now)
+    attachment_path = cp['scrape']['attachment_path']
+
+    client_config = dict(cp['api_client'])
+    client = APIClient.from_signin(**client_config)
+
+    link_follower = FollowLinks(
+        client,
+        link_schema = LinkSchema(),
+        link_result_schema = LinkResultSchema(),
+        allow_rels = set(['documents']),
+    )
+
+    row_mapper = UKGRowMapper()
+
+    fieldnames = row_mapper.get_fieldnames()
+
+    today_with_time = replace_time_part(now)
+    updated_after = months_ago(today_with_time, num_months_ago)
+    query = {'updated_after': iso8601_millis(ensure_utc(updated_after))}
+    logger.info('query: %s', query)
+
+    application_schema = ApplicationSchema()
+    candidate_schema = CandidateSchema()
+    document_schema = DocumentSchema()
+    # TODO
+    # - scrape all the data first
+    # - filter/sort json/dicts
+    # - only then, start hitting for downloads
+    # - maybe only applications are needed for sorting/filtering?
+
+    # Step 1.
+    # Scrape the most recent 1,000 applications by updated_at datetime.
+    logger.info('Scraping the most recent 1,000 applications since %s', updated_after)
+
+    all_applications = []
+    application_pages = client.iter_applications_pages(query=query)
+    pagination = enumerate(application_pages, start=1)
+    for page, applications_page in pagination:
+        for application_number, application_json in enumerate(applications_page, start=1):
+            logger.info('page: %s, %s. application', page, application_number)
+            application_data = application_schema.load(application_json)
+
+            all_applications.append(application_data)
+
+    logger.info('Done scraping %s applications', len(all_applications))
+
+    # Step 2.
+    # Download candidates and files from application objects' data.
+    logger.info('Scraping candidates for applications and writing CSV')
+    latest_1000_applications = sorted(
+        all_applications,
+        key = itemgetter('updated_at'),
+        reverse = True,
+    )
+    latest_1000_applications = latest_1000_applications[:1000]
+    with open(csv_path, 'w', newline='', encoding='utf8') as csv_file:
+        csv_writer = UKGDictWriter(csv_file, fieldnames=fieldnames)
+        csv_writer.writeheader()
+
+        for application_data in latest_1000_applications:
+            candidate_id = application_data['candidate']['id']
+            logger.info('Getting candidate id=%s', candidate_id)
+            candidate_json = client.get_candidate(
+                candidate_id = candidate_id,
+            )
+            if candidate_json is None:
+                logger.warning('No candidate data for %s', candidate_id)
+
+            candidate_data = candidate_schema.load(candidate_json)
+
+            # Follow links for documents
+            for document_json in link_follower.walk_links(application_data):
+                document_data = document_schema.load(document_json)
+
+                download_url = client.get_document_download_url(
+                    application_data['id'],
+                    document_data['id']
+                )
+                logger.info('download_url=%s', download_url)
+
+                download_path = attachment_path.format(
+                    application = application_data,
+                    document = document_data,
+                )
+                download_path = download_path
+                logger.info('download_path=%s', download_path)
+
+                os.makedirs(os.path.dirname(download_path), exist_ok=True)
+                client.download_file(download_url, download_path)
+
+                csv_row = row_mapper.map_row(candidate_data, application_data)
+                file_name = sanitize_filename(os.path.basename(download_path))
+                csv_row['fileName'] = file_name
+                csv_writer.writerow(csv_row)
+
+    logger.info('done')
+
+
+def main(argv=None):
+    """
+    Simple way to investigate the data from the api.
+    """
+    parser = argparse.ArgumentParser(
+        description = main.__doc__
+    )
+    parser.add_argument('config', nargs='+')
+    parser.add_argument('--months-ago', type=int, default='8')
+
+    args = parser.parse_args(argv)
+
+    realmain(args.config, args.months_ago)
+
+if __name__ == '__main__':
+    main()

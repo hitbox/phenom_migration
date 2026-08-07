@@ -1,4 +1,5 @@
 marshmallow
 paramiko
+python-dateutil
 requests
 truststore
