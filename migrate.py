@@ -8,15 +8,16 @@ import logging.config
 import os
 import re
 import time
+import zipfile
 
-from operator import itemgetter
 from configparser import RawConfigParser
 from datetime import datetime
 from datetime import timezone
+from itertools import count
+from operator import itemgetter
 from pprint import pprint
 from requests.exceptions import HTTPError
 
-import marshmallow as mm
 import paramiko
 import requests
 
@@ -195,11 +196,11 @@ class APIClient:
     def download_file(self, url, dest_path, retries=10):
         for attempt in range(retries):
             try:
-                with self.get(url, stream=True, timeout=20) as r:
-                    r.raise_for_status()
+                with self.get(url, stream=True, timeout=20) as response:
+                    response.raise_for_status()
                     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
                     with open(dest_path, 'wb') as f:
-                        for chunk in r.iter_content(chunk_size=8192):
+                        for chunk in response.iter_content(chunk_size=8192):
                             if chunk:
                                 f.write(chunk)
                 return f'success after {attempt} attempts'
@@ -348,8 +349,7 @@ class FollowLinks:
             seen = set()
 
         links = self.link_schema.load(obj['links'], many=True)
-        for link_json in links:
-            link_data = self.link_schema.load(link_json)
+        for link_data in links:
             href = link_data['href']
             rel = link_data['rel']
 
@@ -556,7 +556,7 @@ def safe_json_decode(response):
         logger.error(f"Decode error: {e}")
         return None
 
-def get_sftp(options):
+def get_sftp_client(options):
     host = options['host']
     port = options['port']
     username = options['username']
@@ -611,35 +611,25 @@ def iso8601_millis(dt):
     """
     return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
-def json_dump_line(obj, file, **kwargs):
-    json.dump(document_dump, output_file, **kwargs)
-    output_file.write('\n')
+def join_before_extension(filename, string):
+    root, ext = os.path.splitext(filename)
+    return ''.join([root, string, ext])
 
-def json_dump_line_pretty(obj, file, **kwargs):
-    kwargs.setdefault('indent', 4)
-    return json_dump_line(obj, file, **kwargs)
-
-def realmain(config, num_months_ago=None):
-    cp = configparser.ConfigParser()
-    cp.read(config)
-
-    if set(['loggers', 'handlers', 'formatters']).issubset(cp):
-        # logging available from config file, use it.
-        logging.config.fileConfig(cp)
-
+def realmain(config, cp, num_months_ago=None):
     now = datetime.now()
 
     csv_path = cp['scrape']['csv_path'].format(now=now)
     attachment_path = cp['scrape']['attachment_path']
+    zip_path = cp['scrape']['zip_path']
 
     client_config = dict(cp['api_client'])
     client = APIClient.from_signin(**client_config)
 
     link_follower = FollowLinks(
         client,
+        allow_rels = set(['documents']),
         link_schema = LinkSchema(),
         link_result_schema = LinkResultSchema(),
-        allow_rels = set(['documents']),
     )
 
     row_mapper = UKGRowMapper()
@@ -669,10 +659,10 @@ def realmain(config, num_months_ago=None):
     pagination = enumerate(application_pages, start=1)
     for page, applications_page in pagination:
         for application_number, application_json in enumerate(applications_page, start=1):
-            logger.info('page: %s, %s. application', page, application_number)
             application_data = application_schema.load(application_json)
 
             all_applications.append(application_data)
+        logger.info('page: %s, scraped %s applications', page, len(applications_page))
 
     logger.info('Done scraping %s applications', len(all_applications))
 
@@ -685,7 +675,15 @@ def realmain(config, num_months_ago=None):
         reverse = True,
     )
     latest_1000_applications = latest_1000_applications[:1000]
-    with open(csv_path, 'w', newline='', encoding='utf8') as csv_file:
+    # Begin writing csv and zip.
+
+    # Set to deduplicate file names.
+    filenames = set([])
+    with (
+        open(csv_path, 'w', newline='', encoding='utf8') as csv_file,
+        zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zip_file
+    ):
+        # with csv and zip file open for writing
         csv_writer = UKGDictWriter(csv_file, fieldnames=fieldnames)
         csv_writer.writeheader()
 
@@ -716,14 +714,42 @@ def realmain(config, num_months_ago=None):
                 )
                 download_path = download_path
                 logger.info('download_path=%s', download_path)
+                filename = sanitize_filename(os.path.basename(download_path))
 
-                os.makedirs(os.path.dirname(download_path), exist_ok=True)
-                client.download_file(download_url, download_path)
+                if filename in filenames:
+                    for index in count():
+                        newfn = join_before_extension(filename, f'({index})')
+                        if newfn not in filenames:
+                            logger.info('file %r unique-ified to %r', filenames, newfn)
+                            filename = newfn
+                            break
+                    else:
+                        raise ValueError(f'Unable to make {filename} unique.')
+
+                filenames.add(filename)
+
+                with client.get(download_url, stream=True, timeout=20) as response:
+                    response.raise_for_status()
+                    with zip_file.open(filename, 'w') as archive_file:
+                        for chunk in response.iter_content():
+                            if chunk:
+                                archive_file.write(chunk)
 
                 csv_row = row_mapper.map_row(candidate_data, application_data)
-                file_name = sanitize_filename(os.path.basename(download_path))
-                csv_row['fileName'] = file_name
+                csv_row['fileName'] = filename
                 csv_writer.writerow(csv_row)
+
+    sftp = get_sftp_client(phenompeople.prod)
+
+    uploads = [
+        (zip_path, cp['scrape']['remote_dest_zip'],),
+        (csv_path, cp['scrape']['remote_dest_csv'],),
+    ]
+    for src, dst in uploads:
+        sftp.put(src, dst)
+        logger.info('sftp.put(%r, %r)', src, dst)
+
+    sftp.close()
 
     logger.info('done')
 
@@ -740,7 +766,14 @@ def main(argv=None):
 
     args = parser.parse_args(argv)
 
-    realmain(args.config, args.months_ago)
+    cp = configparser.ConfigParser()
+    cp.read(args.config)
+
+    if set(['loggers', 'handlers', 'formatters']).issubset(cp):
+        # logging available from config file, use it.
+        logging.config.fileConfig(cp)
+
+    realmain(args.config, cp, args.months_ago)
 
 if __name__ == '__main__':
     main()
