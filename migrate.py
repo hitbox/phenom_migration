@@ -742,17 +742,29 @@ def realmain(config, cp, num_months_ago=None):
                 csv_row['fileName'] = filename
                 csv_writer.writerow(csv_row)
 
-    sftp = get_sftp_client(phenompeople.prod)
+    logger.info('Done scraping candidates')
 
-    uploads = [
-        (zip_path, cp['scrape']['remote_dest_zip'],),
-        (csv_path, cp['scrape']['remote_dest_csv'],),
-    ]
-    for src, dst in uploads:
-        sftp.put(src, dst)
-        logger.info('sftp.put(%r, %r)', src, dst)
+    sftp_options = dict(cp['sftp'])
+    try:
+        sftp = get_sftp_client(sftp_options)
 
-    sftp.close()
+        csv_filename = os.path.basename(csv_path)
+
+        uploads = [
+            (
+                zip_path,
+                cp['scrape']['remote_dest_zip'],
+            ),
+            (
+                csv_path,
+                cp['scrape']['remote_dest_csv'].format(csv_filename=csv_filename),
+            ),
+        ]
+        for src, dst in uploads:
+            sftp.put(src, dst)
+            logger.info('sftp.put(%r, %r)', src, dst)
+    finally:
+        sftp.close()
 
     logger.info('done')
 
