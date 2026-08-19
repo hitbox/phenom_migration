@@ -720,9 +720,10 @@ def realmain(config, cp, num_months_ago=None):
 
                 if filename in filenames:
                     for index in count():
+                        # insert a parenthized number before extension.
                         newfn = join_before_extension(filename, f'({index})')
                         if newfn not in filenames:
-                            logger.info('file %r unique-ified to %r', filenames, newfn)
+                            logger.info('file %r unique-ified to %r', filename, newfn)
                             filename = newfn
                             break
                     else:
