@@ -558,7 +558,7 @@ def safe_json_decode(response):
 
 def get_sftp_client(options):
     host = options['host']
-    port = options['port']
+    port = int(options['port'])
     username = options['username']
     password = options['password']
     transport = paramiko.Transport((host, port))
