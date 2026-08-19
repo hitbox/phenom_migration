@@ -679,6 +679,8 @@ def realmain(config, cp, num_months_ago=None):
 
     # Set to deduplicate file names.
     filenames = set([])
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    os.makedirs(os.path.dirname(zip_path), exist_ok=True)
     with (
         open(csv_path, 'w', newline='', encoding='utf8') as csv_file,
         zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zip_file
